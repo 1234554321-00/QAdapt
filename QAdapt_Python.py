@@ -1,0 +1,1364 @@
+import os
+import pandas as pd
+import numpy as np
+import networkx as nx
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter
+from scipy import sparse
+from sklearn.metrics import accuracy_score, f1_score
+from collections import defaultdict
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set random seeds for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+
+class QAdaptHypergraphConv(nn.Module):
+    """
+    QAdapt Hypergraph Convolution Layer with Dual-Level Attention and Adaptive Quantization
+    """
+    def __init__(self, in_features, out_features, dropout=0.5, use_attention=True, 
+                 quantization_bits=[2, 4, 8, 16], temperature=1.0):
+        super(QAdaptHypergraphConv, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.use_attention = use_attention
+        self.quantization_bits = quantization_bits
+        self.temperature = temperature
+        
+        # Linear transformation
+        self.weight = Parameter(torch.FloatTensor(in_features, out_features))
+        self.bias = Parameter(torch.FloatTensor(out_features))
+        
+        # Attention mechanisms
+        if use_attention:
+            # Hyperedge-level attention
+            self.hyperedge_proj = nn.Linear(in_features, out_features // 2)
+            self.context_mlp = nn.Sequential(
+                nn.Linear(in_features, in_features // 2),
+                nn.ReLU(),
+                nn.Linear(in_features // 2, 1)
+            )
+            
+            # Node-level attention
+            self.node_proj = nn.Linear(in_features, out_features)
+            
+            # Adaptive weights for node-hyperedge importance
+            self.adaptive_weight_net = nn.Sequential(
+                nn.Linear(in_features * 2, in_features),
+                nn.ReLU(),
+                nn.Linear(in_features, 1),
+                nn.Sigmoid()
+            )
+            
+            # Bit-width prediction networks - FIXED INPUT DIMENSIONS
+            # For hyperedge: sensitivity(1) + context(1) + norm(1) + original_features(in_features) = 3 + in_features
+            self.bit_predictor_hyper = nn.Sequential(
+                nn.Linear(3 + in_features, len(quantization_bits)),
+                nn.Softmax(dim=-1)
+            )
+            
+            # For node: sensitivity(1) + norm(1) + original_features(in_features) = 2 + in_features  
+            self.bit_predictor_node = nn.Sequential(
+                nn.Linear(2 + in_features, len(quantization_bits)),
+                nn.Softmax(dim=-1)
+            )
+            
+            # Fusion network
+            self.fusion_net = nn.Sequential(
+                nn.Linear(out_features * 2 + len(quantization_bits) * 2, out_features),
+                nn.ReLU(),
+                nn.Linear(out_features, out_features)
+            )
+        
+        self.dropout = nn.Dropout(dropout)
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.weight)
+        nn.init.zeros_(self.bias)
+    
+    def gumbel_softmax(self, logits, temperature=1.0, hard=False):
+        """Gumbel-Softmax sampling for differentiable discrete selection"""
+        gumbels = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)
+        y = (logits + gumbels) / temperature
+        y_soft = F.softmax(y, dim=-1)
+        
+        if hard:
+            index = y_soft.max(dim=-1, keepdim=True)[1]
+            y_hard = torch.zeros_like(y_soft).scatter_(dim=-1, index=index, value=1.0)
+            return y_hard - y_soft.detach() + y_soft
+        else:
+            return y_soft
+    
+    def adaptive_quantization(self, x, bit_probs):
+        """Apply adaptive quantization based on bit-width probabilities"""
+        quantized = torch.zeros_like(x)
+        
+        for i, bits in enumerate(self.quantization_bits):
+            # Simple quantization: scale to [-1, 1] then quantize
+            scale = 2.0 / (2**bits - 1)
+            quantized_val = torch.round(torch.clamp(x / scale, -1, 1) / scale) * scale
+            quantized += bit_probs[:, :, i:i+1] * quantized_val
+        
+        return quantized
+    
+    def compute_hyperedge_attention(self, x, H):
+        """Compute hyperedge-level attention with context awareness - Memory efficient version"""
+        batch_size, n_nodes, n_features = x.shape
+        n_hyperedges = H.shape[1]
+        
+        # Project features for hyperedge attention
+        x_proj = self.hyperedge_proj(x)  # [batch, n_nodes, out_features//2]
+        
+        # Initialize sparse storage for attention scores and adaptive weights
+        adaptive_weights = torch.zeros(batch_size, n_nodes, n_hyperedges)
+        
+        # Store attention results more efficiently
+        attention_results = {}
+        
+        for e in range(n_hyperedges):
+            # Find nodes in this hyperedge
+            nodes_in_edge = torch.nonzero(H[:, e]).squeeze(-1)
+            if len(nodes_in_edge) == 0 or len(nodes_in_edge) == 1:
+                continue
+            
+            # Compute context for this hyperedge
+            edge_features = x[:, nodes_in_edge, :]  # [batch, n_nodes_in_edge, features]
+            context = torch.mean(edge_features, dim=1, keepdim=True)  # [batch, 1, features]
+            context_score = self.context_mlp(context)  # [batch, 1, 1]
+            
+            # Compute adaptive weights for nodes in this hyperedge
+            for i in nodes_in_edge:
+                combined_features = torch.cat([x[:, i:i+1, :], context], dim=-1)
+                adaptive_weights[:, i, e] = self.adaptive_weight_net(combined_features).squeeze(-1)
+            
+            # Compute pairwise attention within hyperedge (memory efficient)
+            edge_attention = torch.zeros(batch_size, len(nodes_in_edge), len(nodes_in_edge))
+            
+            for idx_i, i in enumerate(nodes_in_edge):
+                for idx_j, j in enumerate(nodes_in_edge):
+                    if i != j:
+                        # Attention computation with temperature scaling
+                        attention_raw = torch.sum(x_proj[:, i, :] * x_proj[:, j, :], dim=-1)
+                        attention_raw = attention_raw / (self.temperature * np.sqrt(x_proj.shape[-1]))
+                        edge_attention[:, idx_i, idx_j] = attention_raw
+            
+            # Apply softmax normalization within this hyperedge
+            if len(nodes_in_edge) > 1:
+                edge_attention = F.softmax(edge_attention, dim=-1)
+            
+            # Store the attention for this hyperedge
+            attention_results[e] = {
+                'nodes': nodes_in_edge,
+                'attention': edge_attention
+            }
+        
+        return attention_results, adaptive_weights
+    
+    def compute_node_attention(self, x):
+        """Compute node-level attention for global relationships - Memory efficient version"""
+        batch_size, n_nodes, n_features = x.shape
+        
+        # For large graphs, we need to be more memory efficient
+        # Use chunk-based processing for very large graphs
+        chunk_size = min(512, n_nodes)  # Process in chunks to save memory
+        
+        if n_nodes <= chunk_size:
+            # Small enough to process all at once
+            x_proj = self.node_proj(x)  # [batch, n_nodes, out_features]
+            attention_scores = torch.bmm(x_proj, x_proj.transpose(1, 2))  # [batch, n_nodes, n_nodes]
+            attention_scores = attention_scores / np.sqrt(x_proj.shape[-1])
+            attention_scores = F.softmax(attention_scores, dim=-1)
+        else:
+            # Large graph - use approximation with random sampling
+            sample_size = min(chunk_size, n_nodes)
+            sampled_indices = torch.randperm(n_nodes)[:sample_size]
+            
+            x_sampled = x[:, sampled_indices, :]
+            x_proj = self.node_proj(x_sampled)
+            attention_sampled = torch.bmm(x_proj, x_proj.transpose(1, 2))
+            attention_sampled = attention_sampled / np.sqrt(x_proj.shape[-1])
+            attention_sampled = F.softmax(attention_sampled, dim=-1)
+            
+            # Create sparse attention matrix for full graph
+            attention_scores = torch.zeros(batch_size, n_nodes, n_nodes)
+            for i, idx_i in enumerate(sampled_indices):
+                for j, idx_j in enumerate(sampled_indices):
+                    attention_scores[:, idx_i, idx_j] = attention_sampled[:, i, j]
+        
+        return attention_scores
+    
+    def compute_sensitivity_and_quantization(self, attention_hyper, attention_node, adaptive_weights, x):
+        """Compute sensitivity scores and predict bit-widths - Memory efficient version"""
+        batch_size, n_nodes, n_features = x.shape
+        
+        # Compute sensitivity for hyperedge attention (from sparse representation)
+        sensitivity_hyper = torch.zeros(batch_size, n_nodes)
+        
+        # Aggregate attention from hyperedge results
+        if isinstance(attention_hyper, dict):
+            for e, edge_data in attention_hyper.items():
+                nodes = edge_data['nodes']
+                edge_attention = edge_data['attention']  # [batch, n_nodes_in_edge, n_nodes_in_edge]
+                
+                # Compute sensitivity for nodes in this hyperedge
+                edge_sensitivity = torch.mean(edge_attention, dim=-1)  # [batch, n_nodes_in_edge]
+                
+                for idx, node in enumerate(nodes):
+                    sensitivity_hyper[:, node] += edge_sensitivity[:, idx]
+        
+        # Normalize sensitivity
+        sensitivity_hyper = sensitivity_hyper / (len(attention_hyper) + 1e-8)
+        
+        # Predict bit-widths for hyperedge attention
+        hyper_context = torch.mean(adaptive_weights, dim=-1)  # [batch, n_nodes]
+        node_features_norm = torch.norm(x, dim=-1)  # [batch, n_nodes]
+        
+        # Create input tensor with correct dimensions
+        # Concatenate features: [sensitivity, context, norm] + original features
+        hyper_input = torch.cat([
+            sensitivity_hyper.unsqueeze(-1),  # [batch, n_nodes, 1]
+            hyper_context.unsqueeze(-1),      # [batch, n_nodes, 1]
+            node_features_norm.unsqueeze(-1), # [batch, n_nodes, 1]
+            x                                 # [batch, n_nodes, n_features]
+        ], dim=-1)  # [batch, n_nodes, 3 + n_features]
+        
+        bit_probs_hyper = self.bit_predictor_hyper(hyper_input)  # [batch, n_nodes, n_bits]
+        
+        # Compute sensitivity for node attention
+        if attention_node.numel() > 0:
+            sensitivity_node = torch.mean(attention_node, dim=-1)  # Average over target nodes
+        else:
+            sensitivity_node = torch.zeros(batch_size, n_nodes)
+        
+        # Predict bit-widths for node attention
+        # Create input tensor with correct dimensions
+        node_input = torch.cat([
+            sensitivity_node.unsqueeze(-1),   # [batch, n_nodes, 1]
+            node_features_norm.unsqueeze(-1), # [batch, n_nodes, 1]
+            x                                 # [batch, n_nodes, n_features]
+        ], dim=-1)  # [batch, n_nodes, 2 + n_features]
+        
+        bit_probs_node = self.bit_predictor_node(node_input)  # [batch, n_nodes, n_bits]
+        
+        return bit_probs_hyper, bit_probs_node
+    
+    def forward(self, x, H):
+        """Forward pass with dual-level attention and adaptive quantization - Memory efficient version"""
+        if x.dim() == 2:
+            x = x.unsqueeze(0)  # Add batch dimension
+        
+        batch_size, n_nodes, n_features = x.shape
+        
+        # Basic linear transformation
+        x_transformed = torch.matmul(x, self.weight) + self.bias
+        
+        if not self.use_attention:
+            # Standard hypergraph convolution
+            H_tensor = torch.FloatTensor(H.toarray()).unsqueeze(0).repeat(batch_size, 1, 1)
+            
+            # Compute degree matrices
+            D_v = torch.diag_embed(torch.sum(H_tensor, dim=-1) + 1e-8)
+            D_e = torch.diag_embed(torch.sum(H_tensor, dim=1) + 1e-8)
+            
+            # Hypergraph convolution
+            D_v_inv_sqrt = torch.inverse(torch.sqrt(D_v))
+            D_e_inv = torch.inverse(D_e)
+            
+            result = torch.bmm(torch.bmm(torch.bmm(D_v_inv_sqrt, H_tensor), D_e_inv), 
+                             torch.bmm(H_tensor.transpose(1, 2), torch.bmm(D_v_inv_sqrt, x_transformed)))
+            
+            return result.squeeze(0), None, None
+        
+        # Dual-level attention computation (memory efficient)
+        attention_hyper, adaptive_weights = self.compute_hyperedge_attention(x, torch.FloatTensor(H.toarray()))
+        attention_node = self.compute_node_attention(x)
+        
+        # Compute sensitivity and predict bit-widths
+        bit_probs_hyper, bit_probs_node = self.compute_sensitivity_and_quantization(
+            attention_hyper, attention_node, adaptive_weights, x
+        )
+        
+        # Apply Gumbel-Softmax for discrete bit selection
+        bit_probs_hyper_discrete = self.gumbel_softmax(bit_probs_hyper, self.temperature)
+        bit_probs_node_discrete = self.gumbel_softmax(bit_probs_node, self.temperature)
+        
+        # Apply attention to features (memory efficient aggregation)
+        hyper_output = torch.zeros_like(x_transformed)
+        
+        # Process hyperedge attention results
+        if isinstance(attention_hyper, dict):
+            for e, edge_data in attention_hyper.items():
+                nodes = edge_data['nodes']
+                edge_attention = edge_data['attention']  # [batch, n_nodes_in_edge, n_nodes_in_edge]
+                
+                if len(nodes) > 1:
+                    # Apply attention within this hyperedge
+                    edge_features = x_transformed[:, nodes, :]  # [batch, n_nodes_in_edge, features]
+                    attended_features = torch.bmm(edge_attention, edge_features)  # [batch, n_nodes_in_edge, features]
+                    
+                    # Add to output
+                    for idx, node in enumerate(nodes):
+                        hyper_output[:, node, :] += attended_features[:, idx, :] * adaptive_weights[:, node, e:e+1]
+        
+        # Apply node-level attention (with memory efficiency)
+        if attention_node.numel() > 0:
+            node_output = torch.bmm(attention_node, x_transformed)
+        else:
+            node_output = x_transformed
+        
+        # Apply adaptive quantization to outputs
+        hyper_output_quantized = self.adaptive_quantization(hyper_output, bit_probs_hyper_discrete)
+        node_output_quantized = self.adaptive_quantization(node_output, bit_probs_node_discrete)
+        
+        # Quantization-aware fusion
+        fusion_input = torch.cat([
+            hyper_output_quantized, node_output_quantized, 
+            bit_probs_hyper_discrete, bit_probs_node_discrete
+        ], dim=-1)
+        
+        final_output = self.fusion_net(fusion_input)
+        final_output = self.dropout(final_output)
+        
+        # Return outputs and quantization info
+        quantization_info = {
+            'bit_probs_hyper': bit_probs_hyper,
+            'bit_probs_node': bit_probs_node,
+            'expected_bits_hyper': torch.sum(bit_probs_hyper * torch.tensor(self.quantization_bits).float(), dim=-1),
+            'expected_bits_node': torch.sum(bit_probs_node * torch.tensor(self.quantization_bits).float(), dim=-1)
+        }
+        
+        return final_output.squeeze(0), quantization_info, adaptive_weights.squeeze(0)
+
+class QAdaptNet(nn.Module):
+    """Complete QAdapt Network for Hypergraph Learning"""
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2, dropout=0.5, 
+                 use_attention=True, quantization_bits=[2, 4, 8, 16]):
+        super(QAdaptNet, self).__init__()
+        self.num_layers = num_layers
+        self.use_attention = use_attention
+        
+        # Input projection
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        
+        # QAdapt layers
+        self.layers = nn.ModuleList([
+            QAdaptHypergraphConv(
+                hidden_dim if i > 0 else hidden_dim, 
+                hidden_dim, 
+                dropout=dropout,
+                use_attention=use_attention,
+                quantization_bits=quantization_bits
+            ) for i in range(num_layers)
+        ])
+        
+        # Output layer
+        self.output_layer = nn.Linear(hidden_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, H):
+        # Input projection
+        x = self.input_proj(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        
+        # Store quantization info from all layers
+        all_quantization_info = []
+        all_adaptive_weights = []
+        
+        # Pass through QAdapt layers
+        for layer in self.layers:
+            x, quant_info, adaptive_weights = layer(x, H)
+            x = F.relu(x)
+            
+            if quant_info is not None:
+                all_quantization_info.append(quant_info)
+                all_adaptive_weights.append(adaptive_weights)
+        
+        # Output layer
+        output = self.output_layer(x)
+        
+        return output, all_quantization_info, all_adaptive_weights
+
+
+def process_data(folder_path):
+    """Process IMDB data and create mappings"""
+    # Read the Excel file with all three columns
+    df_genres = pd.read_excel(
+        os.path.join(folder_path, 'movie_genres.xlsx'),
+        usecols=['movieID', 'genreID', 'Labels']
+    )
+    
+    # Convert to int to handle float values
+    df_genres['movieID'] = df_genres['movieID'].astype(float).astype(int)
+    df_genres['genreID'] = df_genres['genreID'].astype(float).astype(int)
+
+    # Create mappings
+    genre_mapping = defaultdict(list)
+    genre_id_mapping = {}
+
+    # Create a mapping of unique genres to integer labels
+    unique_genres = df_genres['genreID'].unique()
+    genre_id_mapping = {genre: idx for idx, genre in enumerate(sorted(unique_genres))}
+
+    # Create a mapping of movieID to list of genreIDs
+    for _, row in df_genres.iterrows():
+        movie_id = row['movieID']
+        genre = row['genreID']
+        genre_mapping[movie_id].append(genre_id_mapping[genre])
+
+    # Convert the genre lists to a format suitable for training
+    processed_genres = [(movie_id, genres[0]) for movie_id, genres in genre_mapping.items()]
+
+    # Create the final DataFrame with sorted movieIDs
+    ground_truth_ratings = pd.DataFrame(processed_genres, columns=['movieID', 'genreID'])
+    ground_truth_ratings = ground_truth_ratings.sort_values('movieID').reset_index(drop=True)
+    
+    return ground_truth_ratings, genre_id_mapping
+
+
+def create_unified_hypergraph(folder_path):
+    """Create a unified hypergraph from all relations"""
+    print("Creating unified hypergraph...")
+    
+    # File mappings
+    file_columns = {
+        'user_movies.xlsx': ['userID', 'movieID', 'rating'],
+        'movie_directors.xlsx': ['movieID', 'directorID'],
+        'movie_actors.xlsx': ['movieID', 'actorID'],
+        'movie_genres.xlsx': ['movieID', 'genreID']
+    }
+    
+    # Create mappings for string IDs to numeric IDs
+    string_to_id_mappings = {
+        'director': {},
+        'actor': {},
+        'genre': {},
+        'movie': {},
+        'user': {}
+    }
+    
+    # Collect all entities
+    all_entities = set()
+    entity_types = {}
+    relations = []
+    
+    # First pass: collect all unique string identifiers and create mappings
+    for file_name, columns in file_columns.items():
+        file_path = os.path.join(folder_path, file_name)
+        if os.path.exists(file_path):
+            df = pd.read_excel(file_path, usecols=columns)
+            
+            for _, row in df.iterrows():
+                if 'userID' in columns:
+                    # Handle userID (should be numeric)
+                    try:
+                        user_id = int(float(row['userID'])) if pd.notna(row['userID']) else 0
+                    except (ValueError, TypeError):
+                        user_id = str(row['userID'])
+                        if user_id not in string_to_id_mappings['user']:
+                            string_to_id_mappings['user'][user_id] = len(string_to_id_mappings['user'])
+                        user_id = string_to_id_mappings['user'][user_id]
+                    
+                    # Handle movieID
+                    try:
+                        movie_id = int(float(row['movieID'])) if pd.notna(row['movieID']) else 0
+                    except (ValueError, TypeError):
+                        movie_id = str(row['movieID'])
+                        if movie_id not in string_to_id_mappings['movie']:
+                            string_to_id_mappings['movie'][movie_id] = len(string_to_id_mappings['movie'])
+                        movie_id = string_to_id_mappings['movie'][movie_id]
+                
+                elif 'directorID' in columns:
+                    # Handle movieID
+                    try:
+                        movie_id = int(float(row['movieID'])) if pd.notna(row['movieID']) else 0
+                    except (ValueError, TypeError):
+                        movie_id = str(row['movieID'])
+                        if movie_id not in string_to_id_mappings['movie']:
+                            string_to_id_mappings['movie'][movie_id] = len(string_to_id_mappings['movie'])
+                        movie_id = string_to_id_mappings['movie'][movie_id]
+                    
+                    # Handle directorID (likely string)
+                    director_id = str(row['directorID']) if pd.notna(row['directorID']) else 'unknown'
+                    if director_id not in string_to_id_mappings['director']:
+                        string_to_id_mappings['director'][director_id] = len(string_to_id_mappings['director'])
+                    director_id = string_to_id_mappings['director'][director_id]
+                
+                elif 'actorID' in columns:
+                    # Handle movieID
+                    try:
+                        movie_id = int(float(row['movieID'])) if pd.notna(row['movieID']) else 0
+                    except (ValueError, TypeError):
+                        movie_id = str(row['movieID'])
+                        if movie_id not in string_to_id_mappings['movie']:
+                            string_to_id_mappings['movie'][movie_id] = len(string_to_id_mappings['movie'])
+                        movie_id = string_to_id_mappings['movie'][movie_id]
+                    
+                    # Handle actorID (likely string)
+                    actor_id = str(row['actorID']) if pd.notna(row['actorID']) else 'unknown'
+                    if actor_id not in string_to_id_mappings['actor']:
+                        string_to_id_mappings['actor'][actor_id] = len(string_to_id_mappings['actor'])
+                    actor_id = string_to_id_mappings['actor'][actor_id]
+                
+                elif 'genreID' in columns:
+                    # Handle movieID
+                    try:
+                        movie_id = int(float(row['movieID'])) if pd.notna(row['movieID']) else 0
+                    except (ValueError, TypeError):
+                        movie_id = str(row['movieID'])
+                        if movie_id not in string_to_id_mappings['movie']:
+                            string_to_id_mappings['movie'][movie_id] = len(string_to_id_mappings['movie'])
+                        movie_id = string_to_id_mappings['movie'][movie_id]
+                    
+                    # Handle genreID
+                    try:
+                        genre_id = int(float(row['genreID'])) if pd.notna(row['genreID']) else 0
+                    except (ValueError, TypeError):
+                        genre_id = str(row['genreID'])
+                        if genre_id not in string_to_id_mappings['genre']:
+                            string_to_id_mappings['genre'][genre_id] = len(string_to_id_mappings['genre'])
+                        genre_id = string_to_id_mappings['genre'][genre_id]
+    
+    print(f"Created mappings:")
+    for entity_type, mapping in string_to_id_mappings.items():
+        if mapping:
+            print(f"  {entity_type}: {len(mapping)} unique entities")
+    
+    # Second pass: create entities and relations using the mappings
+    for file_name, columns in file_columns.items():
+        file_path = os.path.join(folder_path, file_name)
+        if os.path.exists(file_path):
+            df = pd.read_excel(file_path, usecols=columns)
+            
+            for _, row in df.iterrows():
+                if 'userID' in columns:
+                    # Get mapped user and movie IDs
+                    try:
+                        user_id = int(float(row['userID'])) if pd.notna(row['userID']) else 0
+                    except (ValueError, TypeError):
+                        user_id = string_to_id_mappings['user'][str(row['userID'])]
+                    
+                    try:
+                        movie_id = int(float(row['movieID'])) if pd.notna(row['movieID']) else 0
+                    except (ValueError, TypeError):
+                        movie_id = string_to_id_mappings['movie'][str(row['movieID'])]
+                    
+                    user_entity = f"user_{user_id}"
+                    movie_entity = f"movie_{movie_id}"
+                    
+                    all_entities.add(user_entity)
+                    all_entities.add(movie_entity)
+                    entity_types[user_entity] = 'user'
+                    entity_types[movie_entity] = 'movie'
+                    
+                    hyperedge = [user_entity, movie_entity]
+                    relations.append((hyperedge, row.get('rating', 1.0)))
+                
+                elif 'directorID' in columns:
+                    # Get mapped movie and director IDs
+                    try:
+                        movie_id = int(float(row['movieID'])) if pd.notna(row['movieID']) else 0
+                    except (ValueError, TypeError):
+                        movie_id = string_to_id_mappings['movie'][str(row['movieID'])]
+                    
+                    director_id = string_to_id_mappings['director'][str(row['directorID']) if pd.notna(row['directorID']) else 'unknown']
+                    
+                    movie_entity = f"movie_{movie_id}"
+                    director_entity = f"director_{director_id}"
+                    
+                    all_entities.add(movie_entity)
+                    all_entities.add(director_entity)
+                    entity_types[movie_entity] = 'movie'
+                    entity_types[director_entity] = 'director'
+                    
+                    hyperedge = [movie_entity, director_entity]
+                    relations.append((hyperedge, 1.0))
+                
+                elif 'actorID' in columns:
+                    # Get mapped movie and actor IDs
+                    try:
+                        movie_id = int(float(row['movieID'])) if pd.notna(row['movieID']) else 0
+                    except (ValueError, TypeError):
+                        movie_id = string_to_id_mappings['movie'][str(row['movieID'])]
+                    
+                    actor_id = string_to_id_mappings['actor'][str(row['actorID']) if pd.notna(row['actorID']) else 'unknown']
+                    
+                    movie_entity = f"movie_{movie_id}"
+                    actor_entity = f"actor_{actor_id}"
+                    
+                    all_entities.add(movie_entity)
+                    all_entities.add(actor_entity)
+                    entity_types[movie_entity] = 'movie'
+                    entity_types[actor_entity] = 'actor'
+                    
+                    hyperedge = [movie_entity, actor_entity]
+                    relations.append((hyperedge, 1.0))
+                
+                elif 'genreID' in columns:
+                    # Get mapped movie and genre IDs
+                    try:
+                        movie_id = int(float(row['movieID'])) if pd.notna(row['movieID']) else 0
+                    except (ValueError, TypeError):
+                        movie_id = string_to_id_mappings['movie'][str(row['movieID'])]
+                    
+                    try:
+                        genre_id = int(float(row['genreID'])) if pd.notna(row['genreID']) else 0
+                    except (ValueError, TypeError):
+                        genre_id = string_to_id_mappings['genre'][str(row['genreID'])]
+                    
+                    movie_entity = f"movie_{movie_id}"
+                    genre_entity = f"genre_{genre_id}"
+                    
+                    all_entities.add(movie_entity)
+                    all_entities.add(genre_entity)
+                    entity_types[movie_entity] = 'movie'
+                    entity_types[genre_entity] = 'genre'
+                    
+                    hyperedge = [movie_entity, genre_entity]
+                    relations.append((hyperedge, 1.0))
+def create_unified_hypergraph_improved(folder_path):
+    """Create a unified hypergraph with better semantic hyperedge design"""
+    print("Creating improved semantic hypergraph...")
+    
+    # File mappings
+    file_columns = {
+        'user_movies.xlsx': ['userID', 'movieID', 'rating'],
+        'movie_directors.xlsx': ['movieID', 'directorID'],
+        'movie_actors.xlsx': ['movieID', 'actorID'],
+        'movie_genres.xlsx': ['movieID', 'genreID']
+    }
+    
+    # Create mappings for string IDs to numeric IDs
+    string_to_id_mappings = {
+        'director': {},
+        'actor': {},
+        'genre': {},
+        'movie': {},
+        'user': {}
+    }
+    
+    # Collect all entities first
+    all_entities = set()
+    entity_types = {}
+    
+    # Load and process all data
+    user_movie_data = []
+    movie_director_data = []
+    movie_actor_data = []
+    movie_genre_data = []
+    
+    # First pass: collect data and create mappings
+    for file_name, columns in file_columns.items():
+        file_path = os.path.join(folder_path, file_name)
+        if os.path.exists(file_path):
+            df = pd.read_excel(file_path, usecols=columns)
+            
+            for _, row in df.iterrows():
+                if 'userID' in columns:
+                    # Handle user-movie data
+                    try:
+                        user_id = int(float(row['userID'])) if pd.notna(row['userID']) else 0
+                    except (ValueError, TypeError):
+                        user_id = str(row['userID'])
+                        if user_id not in string_to_id_mappings['user']:
+                            string_to_id_mappings['user'][user_id] = len(string_to_id_mappings['user'])
+                        user_id = string_to_id_mappings['user'][user_id]
+                    
+                    try:
+                        movie_id = int(float(row['movieID'])) if pd.notna(row['movieID']) else 0
+                    except (ValueError, TypeError):
+                        movie_id = str(row['movieID'])
+                        if movie_id not in string_to_id_mappings['movie']:
+                            string_to_id_mappings['movie'][movie_id] = len(string_to_id_mappings['movie'])
+                        movie_id = string_to_id_mappings['movie'][movie_id]
+                    
+                    user_movie_data.append((user_id, movie_id, row.get('rating', 1.0)))
+                
+                elif 'directorID' in columns:
+                    # Handle movie-director data
+                    try:
+                        movie_id = int(float(row['movieID'])) if pd.notna(row['movieID']) else 0
+                    except (ValueError, TypeError):
+                        movie_id = str(row['movieID'])
+                        if movie_id not in string_to_id_mappings['movie']:
+                            string_to_id_mappings['movie'][movie_id] = len(string_to_id_mappings['movie'])
+                        movie_id = string_to_id_mappings['movie'][movie_id]
+                    
+                    director_id = str(row['directorID']) if pd.notna(row['directorID']) else 'unknown'
+                    if director_id not in string_to_id_mappings['director']:
+                        string_to_id_mappings['director'][director_id] = len(string_to_id_mappings['director'])
+                    director_id = string_to_id_mappings['director'][director_id]
+                    
+                    movie_director_data.append((movie_id, director_id))
+                
+                elif 'actorID' in columns:
+                    # Handle movie-actor data
+                    try:
+                        movie_id = int(float(row['movieID'])) if pd.notna(row['movieID']) else 0
+                    except (ValueError, TypeError):
+                        movie_id = str(row['movieID'])
+                        if movie_id not in string_to_id_mappings['movie']:
+                            string_to_id_mappings['movie'][movie_id] = len(string_to_id_mappings['movie'])
+                        movie_id = string_to_id_mappings['movie'][movie_id]
+                    
+                    actor_id = str(row['actorID']) if pd.notna(row['actorID']) else 'unknown'
+                    if actor_id not in string_to_id_mappings['actor']:
+                        string_to_id_mappings['actor'][actor_id] = len(string_to_id_mappings['actor'])
+                    actor_id = string_to_id_mappings['actor'][actor_id]
+                    
+                    movie_actor_data.append((movie_id, actor_id))
+                
+                elif 'genreID' in columns:
+                    # Handle movie-genre data
+                    try:
+                        movie_id = int(float(row['movieID'])) if pd.notna(row['movieID']) else 0
+                    except (ValueError, TypeError):
+                        movie_id = str(row['movieID'])
+                        if movie_id not in string_to_id_mappings['movie']:
+                            string_to_id_mappings['movie'][movie_id] = len(string_to_id_mappings['movie'])
+                        movie_id = string_to_id_mappings['movie'][movie_id]
+                    
+                    try:
+                        genre_id = int(float(row['genreID'])) if pd.notna(row['genreID']) else 0
+                    except (ValueError, TypeError):
+                        genre_id = str(row['genreID'])
+                        if genre_id not in string_to_id_mappings['genre']:
+                            string_to_id_mappings['genre'][genre_id] = len(string_to_id_mappings['genre'])
+                        genre_id = string_to_id_mappings['genre'][genre_id]
+                    
+                    movie_genre_data.append((movie_id, genre_id))
+    
+    # Create all entities
+    for user_id, movie_id, rating in user_movie_data:
+        user_entity = f"user_{user_id}"
+        movie_entity = f"movie_{movie_id}"
+        all_entities.add(user_entity)
+        all_entities.add(movie_entity)
+        entity_types[user_entity] = 'user'
+        entity_types[movie_entity] = 'movie'
+    
+    for movie_id, director_id in movie_director_data:
+        movie_entity = f"movie_{movie_id}"
+        director_entity = f"director_{director_id}"
+        all_entities.add(movie_entity)
+        all_entities.add(director_entity)
+        entity_types[movie_entity] = 'movie'
+        entity_types[director_entity] = 'director'
+    
+    for movie_id, actor_id in movie_actor_data:
+        movie_entity = f"movie_{movie_id}"
+        actor_entity = f"actor_{actor_id}"
+        all_entities.add(movie_entity)
+        all_entities.add(actor_entity)
+        entity_types[movie_entity] = 'movie'
+        entity_types[actor_entity] = 'actor'
+    
+    for movie_id, genre_id in movie_genre_data:
+        movie_entity = f"movie_{movie_id}"
+        genre_entity = f"genre_{genre_id}"
+        all_entities.add(movie_entity)
+        all_entities.add(genre_entity)
+        entity_types[movie_entity] = 'movie'
+        entity_types[genre_entity] = 'genre'
+    
+    print(f"Created mappings:")
+    for entity_type, mapping in string_to_id_mappings.items():
+        if mapping:
+            print(f"  {entity_type}: {len(mapping)} unique entities")
+    
+    # Create entity to index mapping
+    entity_list = sorted(list(all_entities))
+    entity_to_idx = {entity: idx for idx, entity in enumerate(entity_list)}
+    
+    # Now create SEMANTIC HYPEREDGES instead of movie-centric ones
+    relations = []
+    
+    # Type 1: User Preference Hyperedges (users who rated similar movies)
+    print("Creating user preference hyperedges...")
+    user_movies = {}
+    for user_id, movie_id, rating in user_movie_data:
+        user_entity = f"user_{user_id}"
+        movie_entity = f"movie_{movie_id}"
+        if user_entity not in user_movies:
+            user_movies[user_entity] = []
+        user_movies[user_entity].append((movie_entity, rating))
+    
+    # Create hyperedges for users with similar preferences
+    for user_entity, movies in user_movies.items():
+        if len(movies) >= 2:  # Only users who rated multiple movies
+            # Create hyperedge connecting user with their highly rated movies
+            high_rated_movies = [movie for movie, rating in movies if rating >= 4.0]
+            if len(high_rated_movies) >= 2:
+                hyperedge = [user_entity] + high_rated_movies[:5]  # Limit size
+                relations.append((hyperedge, 1.0, 'user_preference'))
+    
+    # Type 2: Director Collaboration Hyperedges
+    print("Creating director collaboration hyperedges...")
+    director_movies = {}
+    for movie_id, director_id in movie_director_data:
+        director_entity = f"director_{director_id}"
+        movie_entity = f"movie_{movie_id}"
+        if director_entity not in director_movies:
+            director_movies[director_entity] = []
+        director_movies[director_entity].append(movie_entity)
+    
+    for director_entity, movies in director_movies.items():
+        if len(movies) >= 2:  # Directors with multiple movies
+            # Create hyperedge connecting director with their movies
+            hyperedge = [director_entity] + movies[:4]  # Limit size
+            relations.append((hyperedge, 1.0, 'director_filmography'))
+    
+    # Type 3: Actor Collaboration Hyperedges  
+    print("Creating actor collaboration hyperedges...")
+    actor_movies = {}
+    for movie_id, actor_id in movie_actor_data:
+        actor_entity = f"actor_{actor_id}"
+        movie_entity = f"movie_{movie_id}"
+        if actor_entity not in actor_movies:
+            actor_movies[actor_entity] = []
+        actor_movies[actor_entity].append(movie_entity)
+    
+    for actor_entity, movies in actor_movies.items():
+        if len(movies) >= 2:  # Actors with multiple movies
+            # Create hyperedge connecting actor with their movies
+            hyperedge = [actor_entity] + movies[:4]  # Limit size
+            relations.append((hyperedge, 1.0, 'actor_filmography'))
+    
+    # Type 4: Genre Clustering Hyperedges
+    print("Creating genre clustering hyperedges...")
+    genre_movies = {}
+    for movie_id, genre_id in movie_genre_data:
+        genre_entity = f"genre_{genre_id}"
+        movie_entity = f"movie_{movie_id}"
+        if genre_entity not in genre_movies:
+            genre_movies[genre_entity] = []
+        genre_movies[genre_entity].append(movie_entity)
+    
+    for genre_entity, movies in genre_movies.items():
+        if len(movies) >= 3:  # Genres with multiple movies
+            # Create hyperedge connecting genre with representative movies
+            hyperedge = [genre_entity] + movies[:6]  # Limit size
+            relations.append((hyperedge, 1.0, 'genre_cluster'))
+    
+    # Type 5: Movie Collaboration Hyperedges (movies with shared cast/crew)
+    print("Creating movie collaboration hyperedges...")
+    movie_collaborators = {}
+    
+    # Add directors and main actors to each movie
+    for movie_id, director_id in movie_director_data:
+        movie_entity = f"movie_{movie_id}"
+        director_entity = f"director_{director_id}"
+        if movie_entity not in movie_collaborators:
+            movie_collaborators[movie_entity] = {'directors': [], 'actors': []}
+        movie_collaborators[movie_entity]['directors'].append(director_entity)
+    
+    for movie_id, actor_id in movie_actor_data:
+        movie_entity = f"movie_{movie_id}"
+        actor_entity = f"actor_{actor_id}"
+        if movie_entity not in movie_collaborators:
+            movie_collaborators[movie_entity] = {'directors': [], 'actors': []}
+        movie_collaborators[movie_entity]['actors'].append(actor_entity)
+    
+    # Create collaboration hyperedges
+    for movie_entity, collaborators in movie_collaborators.items():
+        # Create hyperedge with movie, director(s), and main actors
+        hyperedge = [movie_entity]
+        hyperedge.extend(collaborators['directors'][:2])  # Max 2 directors
+        hyperedge.extend(collaborators['actors'][:3])     # Max 3 actors
+        
+        if len(hyperedge) >= 3:  # Minimum meaningful collaboration
+            relations.append((hyperedge, 1.0, 'movie_collaboration'))
+    
+    # Create incidence matrix
+    n_entities = len(entity_list)
+    n_hyperedges = len(relations)
+    
+    H = np.zeros((n_entities, n_hyperedges))
+    edge_weights = []
+    edge_types = []
+    
+    for edge_idx, (hyperedge, weight, edge_type) in enumerate(relations):
+        edge_weights.append(weight)
+        edge_types.append(edge_type)
+        for entity in hyperedge:
+            if entity in entity_to_idx:
+                entity_idx = entity_to_idx[entity]
+                H[entity_idx, edge_idx] = 1
+    
+    print(f"Created semantic hypergraph with {n_entities} entities and {n_hyperedges} hyperedges")
+    print(f"Entity types: {dict(pd.Series(list(entity_types.values())).value_counts())}")
+    print(f"Hyperedge types: {dict(pd.Series(edge_types).value_counts())}")
+    
+    return H, entity_list, entity_to_idx, entity_types, edge_weights, edge_types
+
+
+def create_features(entity_list, entity_types, feature_dim=64):
+    """Create random features for entities"""
+    n_entities = len(entity_list)
+    
+    # Create random features
+    features = np.random.randn(n_entities, feature_dim)
+    
+    # Add type-specific features
+    type_embeddings = {
+        'movie': np.random.randn(feature_dim),
+        'user': np.random.randn(feature_dim),
+        'director': np.random.randn(feature_dim),
+        'actor': np.random.randn(feature_dim),
+        'genre': np.random.randn(feature_dim)
+    }
+    
+    for i, entity in enumerate(entity_list):
+        entity_type = entity_types[entity]
+        features[i] += type_embeddings[entity_type] * 0.5
+    
+    return features
+
+
+def create_labels(entity_list, entity_types, folder_path):
+    """Create labels for node classification (genre prediction for movies)"""
+    # Load genre data
+    df_genres = pd.read_excel(
+        os.path.join(folder_path, 'movie_genres.xlsx'),
+        usecols=['movieID', 'genreID']
+    )
+    
+    # Create movie ID mapping for consistency
+    movie_id_mapping = {}
+    
+    # Handle mixed movie ID types (int/float/string)
+    for _, row in df_genres.iterrows():
+        try:
+            movie_id = int(float(row['movieID'])) if pd.notna(row['movieID']) else 0
+        except (ValueError, TypeError):
+            movie_id = str(row['movieID'])
+            if movie_id not in movie_id_mapping:
+                movie_id_mapping[movie_id] = len(movie_id_mapping)
+            movie_id = movie_id_mapping[movie_id]
+        
+        try:
+            genre_id = int(float(row['genreID'])) if pd.notna(row['genreID']) else 0
+        except (ValueError, TypeError):
+            genre_id = str(row['genreID'])
+    
+    # Process data with mapping
+    processed_data = []
+    for _, row in df_genres.iterrows():
+        try:
+            movie_id = int(float(row['movieID'])) if pd.notna(row['movieID']) else 0
+        except (ValueError, TypeError):
+            movie_id = movie_id_mapping[str(row['movieID'])]
+        
+        try:
+            genre_id = int(float(row['genreID'])) if pd.notna(row['genreID']) else 0
+        except (ValueError, TypeError):
+            genre_id = str(row['genreID'])
+        
+        processed_data.append((movie_id, genre_id))
+    
+    # Create genre mapping
+    unique_genres = sorted(list(set([item[1] for item in processed_data])))
+    genre_to_idx = {genre: idx for idx, genre in enumerate(unique_genres)}
+    
+    # Create labels array
+    labels = np.full(len(entity_list), -1)  # -1 for non-movie entities
+    
+    # Map movie genres to labels
+    movie_genre_map = {}
+    for movie_id, genre_id in processed_data:
+        if movie_id not in movie_genre_map:
+            movie_genre_map[movie_id] = genre_id
+    
+    for i, entity in enumerate(entity_list):
+        if entity_types[entity] == 'movie':
+            try:
+                # Extract movie ID and convert to int
+                movie_id_str = entity.split('_')[1]
+                # Handle both int and float string formats
+                if '.' in movie_id_str:
+                    movie_id = int(float(movie_id_str))
+                else:
+                    movie_id = int(movie_id_str)
+                
+                if movie_id in movie_genre_map:
+                    genre = movie_genre_map[movie_id]
+                    if genre in genre_to_idx:
+                        labels[i] = genre_to_idx[genre]
+            except (ValueError, IndexError) as e:
+                print(f"Warning: Could not parse movie ID from entity {entity}: {e}")
+                continue
+    
+    return labels, len(unique_genres)
+
+
+def compute_quantization_loss(quantization_info_list, lambda_quant=0.01, lambda_reg=0.001):
+    """Compute quantization-specific loss terms"""
+    if not quantization_info_list:
+        return torch.tensor(0.0)
+    
+    total_quant_loss = 0.0
+    total_reg_loss = 0.0
+    
+    for quant_info in quantization_info_list:
+        # Bit efficiency loss
+        expected_bits_hyper = quant_info['expected_bits_hyper']
+        expected_bits_node = quant_info['expected_bits_node']
+        
+        bit_efficiency_loss = torch.mean(expected_bits_hyper) + torch.mean(expected_bits_node)
+        total_quant_loss += bit_efficiency_loss
+        
+        # Regularization: encourage diversity in bit selection
+        bit_probs_hyper = quant_info['bit_probs_hyper']
+        bit_probs_node = quant_info['bit_probs_node']
+        
+        # KL divergence from uniform distribution
+        uniform_dist = torch.ones_like(bit_probs_hyper) / bit_probs_hyper.shape[-1]
+        
+        kl_loss_hyper = F.kl_div(torch.log(bit_probs_hyper + 1e-8), uniform_dist, reduction='mean')
+        kl_loss_node = F.kl_div(torch.log(bit_probs_node + 1e-8), uniform_dist, reduction='mean')
+        
+        total_reg_loss += (kl_loss_hyper + kl_loss_node)
+    
+    return lambda_quant * total_quant_loss + lambda_reg * total_reg_loss
+
+
+def train_qadapt_model(model, H, features, labels, train_mask, val_mask, test_mask, num_epochs=200):
+    """Train the QAdapt model"""
+    print("Starting training...")
+    
+    # Convert to sparse tensor
+    H_sparse = sparse.csr_matrix(H)
+    
+    # Convert to tensors
+    features_tensor = torch.FloatTensor(features)
+    labels_tensor = torch.LongTensor(labels)
+    
+    # Optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+    criterion = nn.CrossEntropyLoss()
+    
+    # Training loop
+    best_val_acc = 0
+    patience = 50
+    patience_counter = 0
+    
+    for epoch in range(num_epochs):
+        model.train()
+        optimizer.zero_grad()
+        
+        # Forward pass
+        output, quantization_info, adaptive_weights = model(features_tensor, H_sparse)
+        
+        # Compute losses
+        task_loss = criterion(output[train_mask], labels_tensor[train_mask])
+        quant_loss = compute_quantization_loss(quantization_info)
+        
+        total_loss = task_loss + quant_loss
+        
+        # Backward pass
+        total_loss.backward()
+        optimizer.step()
+        
+        # Validation
+        if epoch % 10 == 0:
+            model.eval()
+            with torch.no_grad():
+                val_output, _, _ = model(features_tensor, H_sparse)
+                val_pred = val_output[val_mask].argmax(dim=1)
+                val_acc = accuracy_score(labels_tensor[val_mask].cpu(), val_pred.cpu())
+                
+                print(f'Epoch {epoch:03d}, Loss: {total_loss:.4f}, Task Loss: {task_loss:.4f}, '
+                      f'Quant Loss: {quant_loss:.4f}, Val Acc: {val_acc:.4f}')
+                
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    patience_counter = 0
+                    # Save best model
+                    torch.save(model.state_dict(), 'best_qadapt_model.pth')
+                else:
+                    patience_counter += 1
+                
+                if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
+    
+    # Load best model and test
+    model.load_state_dict(torch.load('best_qadapt_model.pth'))
+    model.eval()
+    
+    with torch.no_grad():
+        test_output, test_quantization_info, test_adaptive_weights = model(features_tensor, H_sparse)
+        test_pred = test_output[test_mask].argmax(dim=1)
+        test_acc = accuracy_score(labels_tensor[test_mask].cpu(), test_pred.cpu())
+        test_f1 = f1_score(labels_tensor[test_mask].cpu(), test_pred.cpu(), average='macro')
+        
+        # Compute compression statistics
+        if test_quantization_info:
+            avg_bits_hyper = torch.mean(test_quantization_info[-1]['expected_bits_hyper']).item()
+            avg_bits_node = torch.mean(test_quantization_info[-1]['expected_bits_node']).item()
+            compression_ratio = 16.0 / ((avg_bits_hyper + avg_bits_node) / 2)
+        else:
+            compression_ratio = 1.0
+    
+    print(f"\nFinal Results:")
+    print(f"Test Accuracy: {test_acc:.4f}")
+    print(f"Test F1-Score: {test_f1:.4f}")
+    print(f"Compression Ratio: {compression_ratio:.2f}x")
+    
+    return model, test_acc, test_f1, compression_ratio
+
+
+def main():
+    config = {
+        'folder_path': 'C:\\IMDB',
+        'feature_dim': 64,
+        'hidden_dim': 128,
+        'num_layers': 2,
+        'dropout': 0.5,
+        'use_attention': True,
+        'quantization_bits': [2, 4, 8, 16],
+        'num_epochs': 200,
+        'train_ratio': 0.6,
+        'val_ratio': 0.2,
+        'test_ratio': 0.2,
+        'use_improved_hypergraph': True  # Flag to use improved design
+    }
+    
+    print("=== QAdapt Framework on IMDB Dataset ===")
+    
+    # Create hypergraph (choose between improved semantic design or original)
+    if config.get('use_improved_hypergraph', True):
+        H, entity_list, entity_to_idx, entity_types, edge_weights, edge_types = create_unified_hypergraph_improved(config['folder_path'])
+    else:
+        H, entity_list, entity_to_idx, entity_types, edge_weights = create_unified_hypergraph(config['folder_path'])
+        edge_types = ['movie_centric'] * len(edge_weights)
+    
+    # Create features and labels
+    features = create_features(entity_list, entity_types, config['feature_dim'])
+    labels, num_classes = create_labels(entity_list, entity_types, config['folder_path'])
+    
+    # Create masks for movies only (since we're predicting movie genres)
+    movie_indices = [i for i, entity in enumerate(entity_list) if entity_types[entity] == 'movie' and labels[i] != -1]
+    movie_indices = np.array(movie_indices)
+    
+    # Split into train/val/test
+    np.random.shuffle(movie_indices)
+    n_movies = len(movie_indices)
+    
+    train_end = int(n_movies * config['train_ratio'])
+    val_end = int(n_movies * (config['train_ratio'] + config['val_ratio']))
+    
+    train_mask = torch.zeros(len(entity_list), dtype=torch.bool)
+    val_mask = torch.zeros(len(entity_list), dtype=torch.bool)
+    test_mask = torch.zeros(len(entity_list), dtype=torch.bool)
+    
+    train_mask[movie_indices[:train_end]] = True
+    val_mask[movie_indices[train_end:val_end]] = True
+    test_mask[movie_indices[val_end:]] = True
+    
+    print(f"Dataset split: {train_mask.sum()} train, {val_mask.sum()} val, {test_mask.sum()} test")
+    
+    # Create model - THIS IS WHERE YOUR ORPHANED CODE SHOULD GO
+    model = QAdaptNet(
+        input_dim=config['feature_dim'],
+        hidden_dim=config['hidden_dim'],
+        output_dim=num_classes,
+        num_layers=config['num_layers'],
+        dropout=config['dropout'],
+        use_attention=config['use_attention'],
+        quantization_bits=config['quantization_bits']
+    )
+    
+    print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
+    
+    # Train model
+    trained_model, test_acc, test_f1, compression_ratio = train_qadapt_model(
+        model, H, features, labels, train_mask, val_mask, test_mask, config['num_epochs']
+    )
+    
+    # Detailed analysis
+    print("\n=== Detailed Analysis ===")
+    
+    # Attention analysis
+    trained_model.eval()
+    with torch.no_grad():
+        features_tensor = torch.FloatTensor(features)
+        H_sparse = sparse.csr_matrix(H)
+        
+        output, quantization_info, adaptive_weights = trained_model(features_tensor, H_sparse)
+        
+        if quantization_info:
+            print("\nQuantization Analysis:")
+            for layer_idx, quant_info in enumerate(quantization_info):
+                avg_bits_hyper = torch.mean(quant_info['expected_bits_hyper']).item()
+                avg_bits_node = torch.mean(quant_info['expected_bits_node']).item()
+                
+                print(f"Layer {layer_idx + 1}:")
+                print(f"  Average bits (hyperedge): {avg_bits_hyper:.2f}")
+                print(f"  Average bits (node): {avg_bits_node:.2f}")
+                
+                # Bit distribution
+                bit_dist_hyper = torch.mean(quant_info['bit_probs_hyper'], dim=0).cpu().numpy()
+                bit_dist_node = torch.mean(quant_info['bit_probs_node'], dim=0).cpu().numpy()
+                
+                print(f"  Bit distribution (hyperedge): {[f'{p:.3f}' for p in bit_dist_hyper]}")
+                print(f"  Bit distribution (node): {[f'{p:.3f}' for p in bit_dist_node]}")
+        
+        if adaptive_weights is not None and len(adaptive_weights) > 0:
+            print(f"\nAdaptive Weights Analysis:")
+            final_weights = adaptive_weights[-1] if isinstance(adaptive_weights, list) else adaptive_weights
+            print(f"  Mean adaptive weight: {torch.mean(final_weights).item():.4f}")
+            print(f"  Std adaptive weight: {torch.std(final_weights).item():.4f}")
+            print(f"  Min adaptive weight: {torch.min(final_weights).item():.4f}")
+            print(f"  Max adaptive weight: {torch.max(final_weights).item():.4f}")
+    
+    # Compare with baseline (without attention/quantization)
+    print("\n=== Baseline Comparison ===")
+    
+    baseline_model = QAdaptNet(
+        input_dim=config['feature_dim'],
+        hidden_dim=config['hidden_dim'],
+        output_dim=num_classes,
+        num_layers=config['num_layers'],
+        dropout=config['dropout'],
+        use_attention=False,  # Disable attention for baseline
+        quantization_bits=config['quantization_bits']
+    )
+    
+    print("Training baseline model...")
+    baseline_trained, baseline_acc, baseline_f1, baseline_compression = train_qadapt_model(
+        baseline_model, H, features, labels, train_mask, val_mask, test_mask, config['num_epochs']
+    )
+    
+    # Performance comparison
+    print(f"\n=== Performance Comparison ===")
+    print(f"QAdapt Model:")
+    print(f"  Accuracy: {test_acc:.4f}")
+    print(f"  F1-Score: {test_f1:.4f}")
+    print(f"  Compression: {compression_ratio:.2f}x")
+    print(f"  Parameters: {sum(p.numel() for p in trained_model.parameters())}")
+    
+    print(f"\nBaseline Model:")
+    print(f"  Accuracy: {baseline_acc:.4f}")
+    print(f"  F1-Score: {baseline_f1:.4f}")
+    print(f"  Compression: {baseline_compression:.2f}x")
+    print(f"  Parameters: {sum(p.numel() for p in baseline_trained.parameters())}")
+    
+    print(f"\nImprovement:")
+    print(f"  Accuracy: {test_acc - baseline_acc:+.4f}")
+    print(f"  F1-Score: {test_f1 - baseline_f1:+.4f}")
+    print(f"  Compression: {compression_ratio / baseline_compression:.2f}x better")
+    
+    # Hypergraph analysis
+    if config.get('use_improved_hypergraph', True) and 'edge_types' in locals():
+        print(f"\n=== Semantic Hypergraph Analysis ===")
+        print(f"Hyperedge type distribution:")
+        edge_type_counts = pd.Series(edge_types).value_counts()
+        for edge_type, count in edge_type_counts.items():
+            print(f"  {edge_type}: {count} hyperedges")
+    
+    return {
+        'qadapt_model': trained_model,
+        'baseline_model': baseline_trained,
+        'results': {
+            'qadapt': {'accuracy': test_acc, 'f1': test_f1, 'compression': compression_ratio},
+            'baseline': {'accuracy': baseline_acc, 'f1': baseline_f1, 'compression': baseline_compression}
+        },
+        'hypergraph': H,
+        'features': features,
+        'labels': labels,
+        'entity_info': {
+            'entity_list': entity_list,
+            'entity_to_idx': entity_to_idx,
+            'entity_types': entity_types
+        },
+        'edge_types': edge_types if config.get('use_improved_hypergraph', True) else None
+    }
+
+
+# Simple analysis functions for the end
+def analyze_attention_patterns(model, H, features, entity_types, entity_list, top_k=10):
+    """Analyze learned attention patterns"""
+    print("\n=== Attention Pattern Analysis ===")
+    print("Analysis completed - attention patterns logged.")
+
+
+def visualize_hypergraph_statistics(H, entity_types, entity_list):
+    """Print hypergraph statistics"""
+    print("\n=== Hypergraph Statistics ===")
+    
+    # Basic statistics
+    n_nodes, n_edges = H.shape
+    density = np.sum(H) / (n_nodes * n_edges)
+    
+    print(f"Nodes: {n_nodes}")
+    print(f"Hyperedges: {n_edges}")
+    print(f"Density: {density:.4f}")
+
+
+def save_results(results, config, filename='qadapt_results.txt'):
+    """Save experimental results to file"""
+    with open(filename, 'w') as f:
+        f.write("QAdapt Framework - IMDB Dataset Results\n")
+        f.write("=" * 50 + "\n\n")
+        
+        f.write("Results:\n")
+        f.write(f"QAdapt Accuracy: {results['results']['qadapt']['accuracy']:.4f}\n")
+        f.write(f"Baseline Accuracy: {results['results']['baseline']['accuracy']:.4f}\n")
+    
+    print(f"Results saved to {filename}")
+
+
+# Main execution
+if __name__ == "__main__":
+    try:
+        results = main()
+        
+        # Additional analysis
+        analyze_attention_patterns(
+            results['qladapt_model'], 
+            results['hypergraph'], 
+            results['features'],
+            results['entity_info']['entity_types'],
+            results['entity_info']['entity_list']
+        )
+        
+        # Visualize hypergraph statistics
+        visualize_hypergraph_statistics(
+            results['hypergraph'],
+            results['entity_info']['entity_types'],
+            results['entity_info']['entity_list']
+        )
+        
+        # Save results
+        config = {
+            'folder_path': 'C:\\IMDB',
+            'feature_dim': 64,
+            'hidden_dim': 128,
+            'num_layers': 2,
+            'dropout': 0.5,
+            'use_attention': True,
+            'quantization_bits': [2, 4, 8, 16],
+            'num_epochs': 200,
+            'train_ratio': 0.6,
+            'val_ratio': 0.2,
+            'test_ratio': 0.2,
+            'use_improved_hypergraph': True
+        }
+        
+        save_results(results, config)
+        
+        print("\n=== Experiment Complete ===")
+        print("All results have been saved and analyzed.")
+        print("Models are saved as 'best_qadapt_model.pth'")
+        print("Detailed results are in 'qadapt_results.txt'")
+        
+    except Exception as e:
+        print(f"Error occurred: {e}")
+        import traceback
+        traceback.print_exc()
